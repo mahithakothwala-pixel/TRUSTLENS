@@ -1,0 +1,536 @@
+import re
+import sqlite3
+from datetime import datetime
+from urllib.parse import urlparse
+
+import streamlit as st
+
+DB_NAME = "trustlens.db"
+
+st.set_page_config(
+    page_title="TRUSTLENS",
+    page_icon="🔎",
+    layout="wide"
+)
+
+# ---------- DATABASE ----------
+
+def initialize_database():
+    with sqlite3.connect(DB_NAME) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT,
+                check_type TEXT,
+                content TEXT,
+                verdict TEXT,
+                explanation TEXT
+            )
+        """)
+
+def save_check(check_type, content, verdict, explanation):
+    with sqlite3.connect(DB_NAME) as connection:
+        connection.execute(
+            """INSERT INTO checks
+            (created_at, check_type, content, verdict, explanation)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                check_type,
+                content[:2000],
+                verdict,
+                explanation
+            )
+        )
+
+def get_history():
+    with sqlite3.connect(DB_NAME) as connection:
+        return connection.execute(
+            """SELECT created_at, check_type, content, verdict, explanation
+            FROM checks ORDER BY id DESC LIMIT 100"""
+        ).fetchall()
+
+initialize_database()
+
+# ---------- DESIGN ----------
+
+st.markdown("""
+<style>
+.stApp {
+    background: linear-gradient(135deg, #10162f, #22275b, #174b65);
+    color: #ffffff;
+}
+[data-testid="stSidebar"] {
+    background-color: #11172b;
+}
+h1, h2, h3, p, label {
+    color: #ffffff;
+}
+div.stButton > button {
+    background: linear-gradient(90deg, #6c63ff, #00c9a7);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    min-height: 42px;
+    font-weight: bold;
+}
+div.stButton > button:hover {
+    border: 1px solid white;
+}
+
+/* Black input boxes with readable white text */
+.stApp input,
+.stApp textarea,
+.stApp [data-baseweb="input"] input,
+.stApp [data-baseweb="textarea"] textarea {
+    background-color: #000000 !important;
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff !important;
+    caret-color: #ffffff !important;
+    border: 1px solid #777777 !important;
+}
+
+.stApp input::placeholder,
+.stApp textarea::placeholder {
+    color: #cccccc !important;
+    -webkit-text-fill-color: #cccccc !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- SIDEBAR ----------
+
+st.sidebar.title("🔎 TRUSTLENS")
+#St.sidebar.caption("Advanced Information Verification")
+
+page = st.sidebar.radio(
+    "Navigation",
+    [
+        "Dashboard",
+        "Message Checker",
+        "Link Checker",
+        "Combined Checker",
+        "History & Safety"
+    ]
+)
+
+st.sidebar.divider()
+st.sidebar.info(
+    "TRUSTLENS provides preliminary risk signals. "
+    "A warning is not proof that something is fake."
+)
+
+# ---------- ANALYSIS FUNCTIONS ----------
+
+WARNING_PATTERNS = {
+    "Urgent pressure": [
+        "act immediately",
+        "forward immediately",
+        "urgent",
+        "within 10 minutes",
+        "account will be blocked",
+        "account suspended"
+    ],
+    "Prize or reward claim": [
+        "you have won",
+        "claim your prize",
+        "free gift",
+        "cash reward",
+        "lottery winner"
+    ],
+    "Sensitive information request": [
+        "share your otp",
+        "send your password",
+        "enter your otp",
+        "bank pin",
+        "verify your password"
+    ],
+    "Suspicious money request": [
+        "pay processing fee",
+        "send money to receive",
+        "pay to claim",
+        "transfer money immediately"
+    ],
+    "Unverified forwarding claim": [
+        "forward this to everyone",
+        "send to all contacts",
+        "share with 20 people"
+    ]
+}
+
+def analyze_message(message):
+    text = message.lower()
+    findings = []
+
+    for category, phrases in WARNING_PATTERNS.items():
+        matched = [phrase for phrase in phrases if phrase in text]
+        if matched:
+            findings.append(
+                f"{category}: matched wording — "
+                + ", ".join(matched)
+            )
+
+    if re.search(r"\b(otp|password|bank pin)\b", text):
+        findings.append(
+            "Sensitive credentials are mentioned. "
+            "Never share OTPs, passwords or banking PINs."
+        )
+
+    if not findings:
+        findings.append(
+            "No configured warning patterns were detected. "
+            "This does not prove the message is genuine."
+        )
+
+    if any(
+        word in text
+        for word in ["share your otp", "send your password",
+                     "bank pin", "pay processing fee"]
+    ):
+        verdict = "Potential Scam"
+    elif any(
+        phrase in text
+        for phrase in ["you have won", "claim your prize",
+                       "account will be blocked", "act immediately"]
+    ):
+        verdict = "Suspicious — Verify"
+    else:
+        verdict = "Unverified"
+
+    return verdict, findings
+
+def analyze_link(link):
+    raw_link = link.strip()
+    candidate = raw_link
+
+    if not re.match(r"^https?://", candidate, re.I):
+        candidate = "https://" + candidate
+
+    try:
+        parsed = urlparse(candidate)
+        host = parsed.hostname
+    except ValueError:
+        host = None
+        parsed = None
+
+    findings = []
+
+    if not host or "." not in host:
+        return "Invalid or Unverified", [
+            "The input does not look like a valid web address."
+        ]
+
+    if parsed.scheme != "https":
+        findings.append(
+            "The link does not use HTTPS. "
+            "This alone does not prove it is malicious."
+        )
+
+    if "@" in parsed.netloc:
+        findings.append(
+            "The address contains an @ symbol, which can be "
+            "used to make URLs misleading."
+        )
+
+    if host.startswith("xn--") or ".xn--" in host:
+        findings.append(
+            "The domain uses internationalized encoding. "
+            "Check the spelling carefully."
+        )
+
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+        findings.append(
+            "The link uses an IP address instead of a usual domain."
+        )
+
+    shortened_domains = {
+        "bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly"
+    }
+
+    if host.lower() in shortened_domains:
+        findings.append(
+            "This is a shortened link. Its final destination "
+            "is not visible from the text alone."
+        )
+
+    if host.count("-") >= 3 or len(host) > 45:
+        findings.append(
+            "The domain has unusual formatting or length. "
+            "Check it carefully."
+        )
+
+    if not findings:
+        findings.append(
+            "No basic URL warning patterns were detected. "
+            "The link has not been proven safe."
+        )
+
+    if any("shortened link" in item.lower() for item in findings):
+        verdict = "Caution — Destination Unknown"
+    elif any(
+        "unusual formatting" in item.lower()
+        or "misleading" in item.lower()
+        or "IP address" in item
+        for item in findings
+    ):
+        verdict = "Suspicious — Verify"
+    elif parsed.scheme != "https":
+        verdict = "Caution — Check Link"
+    else:
+        verdict = "Unverified"
+
+    return verdict, findings
+
+# ---------- RESULTS ----------
+
+def calculate_risk(verdict, findings):
+    text = " ".join(findings).lower()
+
+    if verdict == "Potential Scam":
+        return 90
+    elif verdict == "Suspicious — Verify":
+        return 75
+    elif verdict == "Caution — Destination Unknown":
+        return 65
+    elif verdict == "Caution — Check Link":
+        return 55
+    elif verdict == "Invalid or Unverified":
+        return 50
+    elif "no configured warning patterns" in text:
+        return 15
+    else:
+        return 30
+def show_risk_meter(score):
+    if score >= 70:
+        color = "#ff4b4b"
+        label = "High estimated risk"
+    elif score >= 40:
+        color = "#ffb020"
+        label = "Moderate estimated risk"
+    else:
+        color = "#21c55d"
+        label = "Low detected risk"
+
+    st.markdown(
+        f"""
+        <div style="text-align:center; margin:25px auto; max-width:280px;">
+          <div style="
+              width:180px;height:180px;border-radius:50%;
+              margin:auto;display:flex;align-items:center;
+              justify-content:center;flex-direction:column;
+              background:conic-gradient(
+                  {color} {score * 3.6}deg,
+                  #30364d 0deg
+              );
+          ">
+            <div style="
+                width:145px;height:145px;border-radius:50%;
+                background:#10162f;display:flex;
+                align-items:center;justify-content:center;
+                flex-direction:column;color:white;
+            ">
+              <span style="font-size:38px;font-weight:bold;">
+                {score}%
+              </span>
+              <span style="font-size:12px;">RISK SCORE</span>
+            </div>
+          </div>
+          <h3 style="color:{color};margin-top:15px;">{label}</h3>
+          <p style="font-size:12px;color:#cccccc;">
+            Preliminary estimate from configured warning rules;
+            not a verified probability that a claim is false.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def show_result(check_type, content, verdict, findings):
+    explanation = "\n".join(findings)
+    score = calculate_risk(verdict, findings)
+    show_risk_meter(score)
+    if verdict in ["Potential Scam", "Suspicious — Verify",
+                   "Caution — Check Link",
+                   "Caution — Destination Unknown",
+                   "Invalid or Unverified"]:
+        st.warning(f"Assessment: {verdict}")
+    else:
+        st.info(f"Assessment: {verdict}")
+
+    st.markdown("### Why?")
+    for finding in findings:
+        st.write("•", finding)
+
+    st.caption(
+        "This is a preliminary heuristic assessment, not a "
+        "confirmed fact-check or a guarantee of link safety."
+    )
+
+    save_check(check_type, content, verdict, explanation)
+    st.success("Assessment saved to local history.")
+
+# ---------- DASHBOARD ----------
+
+if page == "Dashboard":
+    st.title("🔎 TRUSTLENS Advanced")
+    st.subheader("Message Analysis & Link Risk Assessment")
+
+    st.write(
+        "Investigate suspicious messages and links using "
+        "transparent checks and a saved analysis history."
+    )
+
+    a, b, c = st.columns(3)
+
+    history = get_history()
+    a.metric("Total checks", len(history))
+    b.metric(
+        "Suspicious assessments",
+        sum(
+            1 for row in history
+            if row[3] in ["Potential Scam", "Suspicious — Verify"]
+        )
+    )
+    c.metric("Analysis modules", 2)
+
+    st.markdown("### Start an investigation")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.info("**Message Checker**\n\nFind common scam warning patterns.")
+    with right:
+        st.info("**Link Checker**\n\nInspect URL formatting and basic risk signals.")
+
+    st.caption(
+        "Online evidence search will be added in the next development stage."
+    )
+
+# ---------- MESSAGE CHECKER ----------
+
+elif page == "Message Checker":
+    st.title("📝 Message Checker")
+    st.write("Paste the message you want to investigate.")
+
+    platform = st.selectbox(
+        "Where did you receive it?",
+        ["WhatsApp", "SMS", "Instagram", "Email", "Other"]
+    )
+
+    message = st.text_area(
+        "Message text",
+        height=180,
+        placeholder="Paste the complete message here..."
+    )
+
+    if st.button("Analyze Message", key="message_check"):
+        if not message.strip():
+            st.error("Please enter a message first.")
+        else:
+            verdict, findings = analyze_message(message)
+            show_result(
+                f"Message ({platform})",
+                message,
+                verdict,
+                findings
+            )
+
+# ---------- LINK CHECKER ----------
+
+elif page == "Link Checker":
+    st.title("🔗 Link Checker")
+    st.write("Inspect the structure of a website address.")
+
+    link = st.text_input(
+        "Website URL",
+        placeholder="https://example.com"
+    )
+
+    st.warning(
+        "Do not enter passwords or private information. "
+        "This first version does not visit the website or "
+        "check live threat-intelligence databases."
+    )
+
+    if st.button("Analyze Link", key="link_check"):
+        if not link.strip():
+            st.error("Please enter a website address.")
+        else:
+            verdict, findings = analyze_link(link)
+            show_result("Link", link, verdict, findings)
+
+# ---------- COMBINED CHECKER ----------
+
+elif page == "Combined Checker":
+    st.title("🧩 Combined Checker")
+    st.write("Review a message and any included link together.")
+
+    platform = st.selectbox(
+        "Message platform",
+        ["WhatsApp", "SMS", "Instagram", "Email", "Other"]
+    )
+
+    message = st.text_area(
+        "Message text",
+        height=150,
+        key="combined_message"
+    )
+
+    link = st.text_input(
+        "Link included in the message (optional)",
+        key="combined_link"
+    )
+
+    if st.button("Analyze Both", key="combined_check"):
+        if not message.strip() and not link.strip():
+            st.error("Enter a message, a link, or both.")
+        else:
+            if message.strip():
+                verdict, findings = analyze_message(message)
+                st.markdown("### Message assessment")
+                show_result(
+                    f"Combined Message ({platform})",
+                    message,
+                    verdict,
+                    findings
+                )
+
+            if link.strip():
+                verdict, findings = analyze_link(link)
+                st.markdown("### Link assessment")
+                show_result(
+                    "Combined Link",
+                    link,
+                    verdict,
+                    findings
+                )
+
+# ---------- HISTORY & SAFETY ----------
+
+elif page == "History & Safety":
+    st.title("📚 History & Safety")
+    st.write("Recent assessments saved on this computer.")
+
+    history = get_history()
+
+    if history:
+        for created_at, check_type, content, verdict, explanation in history:
+            with st.expander(
+                f"{created_at} — {check_type} — {verdict}"
+            ):
+                st.write("**Input:**")
+                st.write(content)
+                st.write("**Findings:**")
+                st.write(explanation)
+    else:
+        st.info("No assessments yet. Try the Message or Link Checker.")
+
+    st.divider()
+    st.subheader("Important safety guidance")
+    st.write(
+        "- Never share OTPs, passwords or banking PINs.\n"
+        "- Verify urgent requests through an official channel.\n"
+        "- Do not trust a claim solely because no warning was found.\n"
+        "- Avoid opening suspicious links.\n"
+        "- A real fact-check requires reliable evidence and sources."
+    )
